@@ -55,25 +55,44 @@ func (c *DownloadClient) StartDownload(tracks *[]*models.Track) {
 		slog.Error(err.Error())
 		return
 	}
-	
+
 	for _, d := range c.Downloaders {
 		var g errgroup.Group
 		g.SetLimit(1)
 
-		for _, track := range *tracks {
+		slskdDL, albumMode := d.(*Slskd)
+		albumMode = albumMode && slskdDL.Cfg.AlbumMode
+
+		// In album mode, deduplicate so each album is only searched/downloaded once
+		downloadTracks := *tracks
+		if albumMode {
+			downloadTracks = deduplicateByAlbum(downloadTracks)
+		}
+
+		for _, track := range downloadTracks {
 			if track.Present {
 				continue
 			}
 
 			g.Go(func() error {
-
-				if err := d.QueryTrack(track); err != nil {
-					slog.Warn(err.Error())
-					return nil
-				}
-				if err := d.GetTrack(track); err != nil {
-					slog.Warn(err.Error())
-					return nil
+				if albumMode && track.Album != "" {
+					if err := slskdDL.QueryAlbum(track); err != nil {
+						slog.Warn(err.Error())
+						return nil
+					}
+					if err := slskdDL.GetAlbum(track); err != nil {
+						slog.Warn(err.Error())
+						return nil
+					}
+				} else {
+					if err := d.QueryTrack(track); err != nil {
+						slog.Warn(err.Error())
+						return nil
+					}
+					if err := d.GetTrack(track); err != nil {
+						slog.Warn(err.Error())
+						return nil
+					}
 				}
 				return nil
 			})
@@ -83,13 +102,55 @@ func (c *DownloadClient) StartDownload(tracks *[]*models.Track) {
 		}
 
 		if m, ok := d.(Monitor); ok {
-			err := c.MonitorDownloads(*tracks, m)
+			err := c.MonitorDownloads(downloadTracks, m)
 			if err != nil {
 				slog.Warn(err.Error())
 			}
 		}
+
+		// Mark all tracks from a successfully downloaded album as present
+		if albumMode {
+			propagateAlbumPresent(*tracks)
+		}
 	}
 	filterLocalTracks(tracks, false)
+}
+
+// deduplicateByAlbum returns one representative track per (MainArtist, Album) pair.
+// Tracks without an album are kept as-is.
+func deduplicateByAlbum(tracks []*models.Track) []*models.Track {
+	seen := make(map[string]bool)
+	result := make([]*models.Track, 0, len(tracks))
+	for _, t := range tracks {
+		if t.Album == "" || t.MainArtist == "" {
+			result = append(result, t)
+			continue
+		}
+		key := strings.ToLower(t.MainArtist + "|" + t.Album)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, t)
+		}
+	}
+	return result
+}
+
+// propagateAlbumPresent marks all tracks from an album as present when at least
+// one track from that album was successfully downloaded.
+func propagateAlbumPresent(tracks []*models.Track) {
+	presentAlbums := make(map[string]bool)
+	for _, t := range tracks {
+		if t.Present && t.Album != "" {
+			presentAlbums[strings.ToLower(t.MainArtist+"|"+t.Album)] = true
+		}
+	}
+	for _, t := range tracks {
+		if !t.Present && t.Album != "" {
+			if presentAlbums[strings.ToLower(t.MainArtist+"|"+t.Album)] {
+				t.Present = true
+			}
+		}
+	}
 }
 
 func (c *DownloadClient) DeleteSongs() {

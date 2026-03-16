@@ -343,6 +343,193 @@ func (c Slskd) queueDownload(files []File, track *models.Track) error {
 }
 
 
+// QueryAlbum searches slskd for the album instead of an individual track.
+func (c *Slskd) QueryAlbum(track *models.Track) error {
+	ID, err := c.searchAlbum(track)
+	if err != nil {
+		return err
+	}
+	albumDetails := fmt.Sprintf("%s - %s", track.Album, track.MainArtist)
+	slog.Info("initiating album search", "album", albumDetails)
+
+	defer func() {
+		if track.ID == "" {
+			if delErr := c.deleteSearch(ID); delErr != nil {
+				slog.Warn("failed to delete search", "service", "slskd", "context", delErr.Error())
+			}
+		}
+	}()
+
+	completed, err := c.searchStatus(ID, albumDetails, 0)
+	if err != nil {
+		return err
+	}
+	if !completed {
+		return fmt.Errorf("search not completed for album %s, skipping", albumDetails)
+	}
+
+	track.ID = ID
+	return nil
+}
+
+func (c Slskd) searchAlbum(track *models.Track) (string, error) {
+	reqParams := "/api/v0/searches"
+	payload := fmt.Appendf(nil, `{"searchText": "%s %s"}`, track.MainArtist, track.Album)
+
+	body, err := c.HttpClient.MakeRequest("POST", c.Cfg.URL+reqParams, bytes.NewReader(payload), c.Headers)
+	if err != nil {
+		return "", err
+	}
+	var queryResult Search
+	if err := util.ParseResp(body, &queryResult); err != nil {
+		return "", err
+	}
+	return queryResult.ID, nil
+}
+
+// GetAlbum queues all files from the best matching album directory in the search results.
+// track.File is set to the file that best matches the individual track (for monitoring).
+func (c *Slskd) GetAlbum(track *models.Track) error {
+	results, err := c.searchResults(track.ID)
+	if err != nil {
+		return err
+	}
+	username, albumFiles, trackFile, err := c.CollectAlbumDirectory(*track, results)
+	if err != nil {
+		return err
+	}
+	if err := c.queueAlbumDownload(albumFiles, username, track, trackFile); err != nil {
+		return err
+	}
+	return nil
+}
+
+// CollectAlbumDirectory finds the directory (from any user) that best matches the album
+// and returns all audio files within it, plus the file closest to the requested track.
+func (c Slskd) CollectAlbumDirectory(track models.Track, results SearchResults) (string, []File, File, error) {
+	sanitizedArtist := util.AlnumOnly(track.MainArtist)
+	sanitizedAlbum := util.AlnumOnly(track.Album)
+	sanitizedTitle := util.AlnumOnly(track.CleanTitle)
+
+	type dirEntry struct {
+		username string
+		files    []File
+	}
+
+	dirMap := make(map[string]*dirEntry)
+
+	for _, result := range results {
+		if result.FileCount == 0 || !result.HasFreeUploadSlot {
+			continue
+		}
+		for _, file := range result.Files {
+			file.Extension = strings.TrimPrefix(strings.ToLower(file.Extension), ".")
+			if file.Extension == "" {
+				ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(string(file.Name))), ".")
+				file.Extension = util.AlnumOnly(ext)
+			}
+			if !slices.Contains(c.Cfg.Filters.Extensions, file.Extension) {
+				continue
+			}
+
+			normalizedPath := strings.ReplaceAll(file.Name, `\`, `/`)
+			dir := filepath.Dir(normalizedPath)
+			dirName := filepath.Base(dir)
+
+			sanitizedDir := util.AlnumOnly(dirName)
+			sanitizedPath := util.AlnumOnly(normalizedPath)
+
+			// Accept if directory name matches album, or the full path contains both artist and album
+			matchesAlbum := containsLower(sanitizedDir, sanitizedAlbum)
+			matchesPath := containsLower(sanitizedPath, sanitizedArtist) && containsLower(sanitizedPath, sanitizedAlbum)
+			if !matchesAlbum && !matchesPath {
+				continue
+			}
+
+			file.Username = result.Username
+			key := result.Username + "|" + dir
+			if _, exists := dirMap[key]; !exists {
+				dirMap[key] = &dirEntry{username: result.Username}
+			}
+			dirMap[key].files = append(dirMap[key].files, file)
+		}
+	}
+
+	if len(dirMap) == 0 {
+		return "", nil, File{}, fmt.Errorf("no album directory found for %s - %s", track.MainArtist, track.Album)
+	}
+
+	// Pick the directory with the most audio files
+	var bestEntry *dirEntry
+	for _, entry := range dirMap {
+		if bestEntry == nil || len(entry.files) > len(bestEntry.files) {
+			bestEntry = entry
+		}
+	}
+
+	// Apply quality filters; fall back to all files if none pass
+	var filtered []File
+	for _, ext := range c.Cfg.Filters.Extensions {
+		for _, file := range bestEntry.files {
+			if file.Extension != ext {
+				continue
+			}
+			if file.BitRate > 0 && file.BitRate <= c.Cfg.Filters.MinBitRate {
+				continue
+			}
+			if file.BitDepth > 0 && file.BitDepth <= c.Cfg.Filters.MinBitDepth {
+				continue
+			}
+			filtered = append(filtered, file)
+		}
+	}
+	if len(filtered) == 0 {
+		filtered = bestEntry.files
+	}
+
+	// Find the file within the album that best matches the requested track (for monitoring)
+	var trackFile File
+	for _, file := range filtered {
+		filename := util.AlnumOnly(filepath.Base(strings.ReplaceAll(file.Name, `\`, `/`)))
+		if containsLower(filename, sanitizedTitle) {
+			trackFile = file
+			break
+		}
+	}
+	if trackFile.Name == "" {
+		trackFile = filtered[0]
+	}
+
+	return bestEntry.username, filtered, trackFile, nil
+}
+
+func (c Slskd) queueAlbumDownload(files []File, username string, track *models.Track, trackFile File) error {
+	payload := make([]DownloadPayload, len(files))
+	for i, file := range files {
+		payload[i] = DownloadPayload{Filename: file.Name, Size: file.Size}
+	}
+
+	reqParams := fmt.Sprintf("/api/v0/transfers/downloads/%s", username)
+	DLpayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %s", err.Error())
+	}
+
+	_, err = c.HttpClient.MakeRequest("POST", c.Cfg.URL+reqParams, bytes.NewBuffer(DLpayload), c.Headers)
+	if err != nil {
+		if delErr := c.deleteSearch(track.ID); delErr != nil {
+			slog.Debug("failed to delete search", logging.RuntimeAttr(delErr.Error()))
+		}
+		return fmt.Errorf("couldn't queue album download for %s - %s: %s", track.MainArtist, track.Album, err.Error())
+	}
+
+	track.MainArtistID = username
+	track.Size = trackFile.Size
+	track.File = trackFile.Name
+	slog.Info("queued album download", "artist", track.MainArtist, "album", track.Album, "files", len(files))
+	return nil
+}
+
 func (c *Slskd) GetDownloadStatus(tracks []*models.Track) (map[string]FileStatus, error) {
 	reqParams := "/api/v0/transfers/downloads"
 	fileStatuses := make(map[string]FileStatus, len(tracks))
