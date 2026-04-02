@@ -354,7 +354,7 @@ func (c *ListenBrainz) parsePlaylist(identifier string, singleArtist bool) ([]*m
 				for _, a := range trackArtists[2:] {
 					b.WriteString(", ")
 					b.WriteString(a.ArtistCreditName)
-}
+				}
 				title = b.String()
 				artist = trackArtists[0].ArtistCreditName
 			}
@@ -370,8 +370,71 @@ func (c *ListenBrainz) parsePlaylist(identifier string, singleArtist bool) ([]*m
 		})
 	}
 
-	return tracks, nil
+	// Enrich tracks that have no album by fetching metadata from LB using the
+	// recording MBID embedded in each track's JSPF identifier field.
+	var missingIdxs []int
+	var missingMbids []string
+	for i, t := range tracks {
+		if t.Album != "" {
+			continue
+		}
+		mbid := extractMbidFromIdentifiers(srcTracks[i].Identifier)
+		if mbid != "" {
+			missingIdxs = append(missingIdxs, i)
+			missingMbids = append(missingMbids, mbid)
+		}
+	}
+	if len(missingMbids) > 0 {
+		albumMap, err := c.fetchAlbumsByMbid(missingMbids)
+		if err != nil {
+			slog.Warn("failed to enrich missing album metadata", "err", err)
+		} else {
+			for j, idx := range missingIdxs {
+				if album, ok := albumMap[missingMbids[j]]; ok && album != "" {
+					tracks[idx].Album = album
+				} else {
+					slog.Warn("no album found for track, will download as single",
+						"title", tracks[idx].CleanTitle,
+						"artist", tracks[idx].MainArtist,
+					)
+				}
+			}
+		}
+	}
 
+	return tracks, nil
+}
+
+// extractMbidFromIdentifiers pulls a recording MBID UUID out of JSPF identifier
+// strings, which are typically MusicBrainz URLs like
+// "https://musicbrainz.org/recording/<uuid>".
+func extractMbidFromIdentifiers(ids []string) string {
+	for _, id := range ids {
+		parts := strings.Split(id, "/")
+		last := parts[len(parts)-1]
+		if len(last) == 36 {
+			return last
+		}
+	}
+	return ""
+}
+
+// fetchAlbumsByMbid calls the LB metadata/recording endpoint for a batch of
+// recording MBIDs and returns a map of MBID → release name.
+func (c *ListenBrainz) fetchAlbumsByMbid(mbids []string) (map[string]string, error) {
+	body, err := c.lbRequest(fmt.Sprintf("metadata/recording/?recording_mbids=%s&inc=release", strings.Join(mbids, ",")))
+	if err != nil {
+		return nil, err
+	}
+	var recordings Recordings
+	if err := util.ParseResp(body, &recordings); err != nil {
+		return nil, err
+	}
+	result := make(map[string]string, len(recordings))
+	for mbid, meta := range recordings {
+		result[mbid] = meta.Release.Name
+	}
+	return result, nil
 }
 
 // Handle ListenBrainz API requests

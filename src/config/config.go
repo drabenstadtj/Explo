@@ -128,8 +128,10 @@ type SlskdMon struct {
 }
 
 type DiscoveryConfig struct {
-	Discovery string `env:"DISCOVERY_SERVICE" env-default:"listenbrainz"`
+	Discovery    string `env:"DISCOVERY_SERVICE" env-default:"listenbrainz"`
 	Listenbrainz Listenbrainz
+	Cr8URL       string `env:"CR8_URL"`
+	Cr8APIKey    string `env:"CR8_API_KEY"`
 }
 type Listenbrainz struct {
 	Discovery string `env:"LISTENBRAINZ_DISCOVERY" env-default:"playlist"`
