@@ -20,7 +20,7 @@ fi
 
 # $CRON_SCHEDULE was deprecated in v0.11.0, keeping this block for backwards compatibility
 if [ -n "$CRON_SCHEDULE" ]; then
-    echo "$CRON_SCHEDULE $EXEC sh -c 'cd /opt/explo && ./explo >> /proc/1/fd/1 2>&1'" > /etc/crontabs/root
+    echo "$CRON_SCHEDULE $EXEC sh -c 'cd /opt/explo && ./explo' >> /proc/1/fd/1 2>&1"
     chmod 600 /etc/crontabs/root
     echo "[setup] Registered single CRON_SCHEDULE job: $CRON_SCHEDULE"
     crond -f -l 2
@@ -38,7 +38,7 @@ for var in $(env | grep "_SCHEDULE=" | cut -d= -f1); do
     continue
   fi
 
-  cmd="$EXEC sh -c 'cd /opt/explo && ./explo $flags >> /proc/1/fd/1 2>&1'"
+  cmd="$EXEC sh -c 'cd /opt/explo && ./explo $flags' >> /proc/1/fd/1 2>&1"
 
   echo "$schedule $cmd" >> /etc/crontabs/root
   echo "[setup] Registered job: $job"
